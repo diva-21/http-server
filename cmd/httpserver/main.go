@@ -29,7 +29,7 @@ type Request struct {
 	Method          string
 	ResourcePath    string
 	ProtocolVersion string
-	Field_Names     map[string][]string
+	FieldNames     map[string][]string
 	Body            []byte
 	QueryParams     url.Values
 }
@@ -171,7 +171,7 @@ func NewServer() *Server {
 
 func parseHeader(reader *bufio.Reader) (Request, error) {
 	parsedReq := Request{}
-	parsedReq.Field_Names = make(map[string][]string)
+	parsedReq.FieldNames = make(map[string][]string)
 
 	// 1. Parsing the first request line (method one)
 	requestLine, err := reader.ReadString('\n')
@@ -219,7 +219,7 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 			return parsedReq, fmt.Errorf("Invalid key-value in header. Key: %q , value : %q", key, value)
 		}
 
-		parsedReq.Field_Names[key] = append(parsedReq.Field_Names[key], value)
+		parsedReq.FieldNames[key] = append(parsedReq.FieldNames[key], value)
 	}
 	return parsedReq, nil
 }
@@ -227,7 +227,7 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 func parseBody(reader *bufio.Reader, req *Request) ([]byte, error) {
 	// we are checking whether content-length is present or not. if not then no body
 
-	contentLengthStrRes := req.Field_Names["content-length"]
+	contentLengthStrRes := req.FieldNames["content-length"]
 	if len(contentLengthStrRes) == 0 {
 		// no content length header is present
 		fmt.Println("No content length header is present")
