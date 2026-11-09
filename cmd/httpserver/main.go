@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,11 +31,69 @@ type Request struct {
 	Method          string
 	ResourcePath    string
 	ProtocolVersion string
-	FieldNames     map[string][]string
+	Headers         map[string][]string
 	Body            []byte
 	QueryParams     url.Values
 }
 
+func isTokenChar(c byte) bool {
+	if c >= 'a' && c <= 'z' ||
+		c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' {
+		return true
+	}
+
+	return strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))
+}
+
+func validateHeader(key, value string) error {
+	if key == "" {
+		return fmt.Errorf("empty header name")
+	}
+
+	for i := 0; i < len(key); i++ {
+		if !isTokenChar(key[i]) {
+			return fmt.Errorf("invalid header name: %q", key)
+		}
+	}
+
+	if strings.ContainsAny(key, "\r\n:") {
+		return fmt.Errorf("invalid header name: %q", key)
+	}
+
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("invalid header value for %q", key)
+	}
+
+	return nil
+}
+
+func normalizeHeaders(headers map[string]string) (map[string]string, error) {
+	normalized := make(map[string]string)
+
+	for key, value := range headers {
+		lowerKey := strings.ToLower(key)
+
+		// validate key val
+		if err := validateHeader(lowerKey, value); err != nil {
+			return nil, err
+		}
+
+		// duplicate headers
+		if _, exists := normalized[lowerKey]; exists {
+			return nil, fmt.Errorf("duplicate response header: %s", key)
+		}
+
+		normalized[lowerKey] = value
+	}
+
+	return normalized, nil
+}
+func ensureHeaders(res *Response) {
+	if res.Headers == nil {
+		res.Headers = make(map[string]string)
+	}
+}
 func (e *HTTPError) Error() string {
 	if e.Err != nil {
 		return e.Message + ": " + e.Err.Error()
@@ -46,11 +106,21 @@ func (s *Server) HandleError(
 	err error,
 	res *Response,
 ) {
-	if res.StatusCode > 100 && res.StatusCode < 600 {
-		res.Body = []byte(StatusText(res.StatusCode))
+	ensureHeaders(res)
+
+	// check if its HTTP Error, or produce a generic error
+
+	var httpErr *HTTPError
+
+	if errors.As(err, httpErr) {
+		res.StatusCode = httpErr.StatusCode
+		res.Body = []byte(httpErr.Message)
 	} else {
-		res.Body = []byte("Unknown error from the server")
+		res.StatusCode = 500
+		res.Body = []byte("Internal Server Error")
 	}
+
+	res.Headers["Content-Type"] = "text/plain"
 }
 func StatusText(statusCode int) string {
 	switch statusCode {
@@ -114,6 +184,13 @@ func (s *Server) HandleDELETE(req *Request, res *Response) error {
 }
 func (s *Server) HandleRequest(req *Request, res *Response) error {
 
+	// ensure headers are initialized
+	ensureHeaders(res)
+
+	if req == nil || res == nil {
+		return fmt.Errorf("nil request or response")
+	}
+
 	method := strings.TrimSpace(strings.ToUpper(req.Method))
 	if method == "" {
 		log.Println("Method cant be empty", method)
@@ -143,25 +220,51 @@ func (s *Server) HandleRequest(req *Request, res *Response) error {
 }
 
 func WriteResponse(cn net.Conn, res *Response) error {
-	// response formatting
-	res.Headers["Content-Length"] = strconv.Itoa(len(res.Body))
 
-	var responseStr strings.Builder
+	if cn == nil {
+		return fmt.Errorf("nil connection")
+	}
+	if res == nil {
+		return fmt.Errorf("nil response")
+	}
 
-	responseStr.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", res.StatusCode, StatusText(res.StatusCode)))
+	if res.StatusCode < 100 || res.StatusCode > 599 {
+		return fmt.Errorf("invalid response status code: %d", res.StatusCode)
+	}
+
+	ensureHeaders(res)
+
+	headers, err := normalizeHeaders(res.Headers)
+
+	if err != nil {
+		return err
+	}
+
+	res.Headers = headers
+
+	res.Headers["content-length"] = strconv.Itoa(len(res.Body))
+	res.Headers["connection"] = "close"
+
+	var responseCn bytes.Buffer
+
+	// Status line
+	responseCn.WriteString(fmt.Sprintf(
+		"HTTP/1.1 %d %s\r\n",
+		res.StatusCode,
+		StatusText(res.StatusCode),
+	))
 
 	for k, v := range res.Headers {
-		responseStr.WriteString(k + ":" + " " + v + "\r\n")
+		responseCn.WriteString(k + ":" + " " + v + "\r\n")
 	}
-	responseStr.WriteString("\r\n")
-	responseStr.Write(res.Body)
+	responseCn.WriteString("\r\n")
+	responseCn.Write(res.Body)
 
-	_, err := cn.Write([]byte(responseStr.String()))
-	if err != nil {
-		log.Println("err in writing the response", err)
-		return fmt.Errorf("Error in writing response %v\n", err)
+	_, writeErr := io.Copy(cn, &responseCn)
+	if writeErr != nil {
+		return fmt.Errorf("writing response: %w", err)
 	}
-	fmt.Println("Response written successfully")
+
 	return nil
 }
 
@@ -171,7 +274,7 @@ func NewServer() *Server {
 
 func parseHeader(reader *bufio.Reader) (Request, error) {
 	parsedReq := Request{}
-	parsedReq.FieldNames = make(map[string][]string)
+	parsedReq.Headers = make(map[string][]string)
 
 	// 1. Parsing the first request line (method one)
 	requestLine, err := reader.ReadString('\n')
@@ -187,9 +290,24 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 	}
 
 	// METHOD /RESOURCE-PATH PROTOCOL-VERSION 	\r\n
-	parsedReq.Method = splitReqLines[0]
+	parsedReq.Method = strings.ToUpper(splitReqLines[0])
 	parsedReq.ResourcePath = splitReqLines[1]
 	parsedReq.ProtocolVersion = splitReqLines[2]
+
+	// validate for Method
+	for i := 0; i < len(parsedReq.Method); i++ {
+		if !isTokenChar(parsedReq.Method[i]) {
+			return parsedReq, fmt.Errorf("invalid HTTP method")
+		}
+	}
+
+	// validate for http version
+	if parsedReq.ProtocolVersion != "HTTP/1.1" {
+		return parsedReq, &HTTPError{
+			StatusCode: 505,
+			Message:    "HTTP Version Not Supported",
+		}
+	}
 
 	// 2. Parsing the field names / headers ( key : values ) until the blank line
 	// example Host: x.com , Content-Length: 11
@@ -203,7 +321,6 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 		line = strings.TrimRight(line, "\r\n")
 
 		if line == "" {
-			// this only works for GET, not for POST ( it would have request body after end of line )
 			fmt.Println("its a \r\n line ")
 			break
 		}
@@ -215,82 +332,130 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 		key := strings.ToLower(strings.TrimSpace(headerParts[0])) // lower for avoid case-insensitive
 		value := strings.TrimSpace(headerParts[1])
 
-		if key == "" || value == "" {
-			return parsedReq, fmt.Errorf("Invalid key-value in header. Key: %q , value : %q", key, value)
+		if key == "" {
+			return parsedReq, fmt.Errorf("invalid header format")
 		}
 
-		parsedReq.FieldNames[key] = append(parsedReq.FieldNames[key], value)
+		// Validate header name
+		for i := 0; i < len(key); i++ {
+			if !isTokenChar(key[i]) {
+				return parsedReq, fmt.Errorf("invalid header name: %q", key)
+			}
+		}
+
+		parsedReq.Headers[key] = append(parsedReq.Headers[key], value)
 	}
 	return parsedReq, nil
 }
 
 func parseBody(reader *bufio.Reader, req *Request) ([]byte, error) {
-	// we are checking whether content-length is present or not. if not then no body
 
-	contentLengthStrRes := req.FieldNames["content-length"]
-	if len(contentLengthStrRes) == 0 {
-		// no content length header is present
-		fmt.Println("No content length header is present")
+	const maxBodySize = 1 << 20 // 1 MiB
+
+	// Reject unsupported transfer encoding for now.
+	if len(req.Headers["transfer-encoding"]) > 0 {
+		return nil, &HTTPError{
+			StatusCode: 501,
+			Message:    "Transfer-Encoding is not supported",
+		}
+	}
+
+	contentLengths := req.Headers["content-length"]
+
+	if len(contentLengths) == 0 {
+		req.Body = nil
 		return nil, nil
 	}
-	contentLengthStr := contentLengthStrRes[0] // content-length will be once in header
-	contentLength, err := strconv.Atoi(contentLengthStr)
-	if err != nil || contentLength < 0 {
-		return nil, fmt.Errorf("Invalid content-length")
+
+	if len(contentLengths) != 1 {
+		return nil, &HTTPError{
+			StatusCode: 400,
+			Message:    "Multiple Content-Length headers",
+		}
 	}
 
-	// make []byte of contentLength
+	contentLength, err := strconv.Atoi(contentLengths[0])
+	if err != nil || contentLength < 0 {
+		return nil, &HTTPError{
+			StatusCode: 400,
+			Message:    "Invalid Content-Length",
+		}
+	}
+
+	if contentLength > maxBodySize {
+		return nil, &HTTPError{
+			StatusCode: 413,
+			Message:    "Request body too large",
+		}
+	}
+
 	bodyBuffer := make([]byte, contentLength)
 
+	// CHANGE 1: Capture the number of bytes read ('n') and use 'readErr' explicitly
 	n, readErr := io.ReadFull(reader, bodyBuffer)
-
 	if readErr != nil {
-
+		// CHANGE 2: Your specific check for unexpected EOF
 		if readErr == io.ErrUnexpectedEOF {
 			return nil, fmt.Errorf("Interruption ; Read %d/%d bytes : %w", n, contentLength, readErr)
 		}
-		return nil, readErr
-	}
-	req.Body = bodyBuffer
-	return bodyBuffer, nil
 
+		// Fallback for any other read errors
+		return nil, &HTTPError{
+			StatusCode: 400,
+			Message:    "Incomplete request body",
+			Err:        readErr,
+		}
+	}
+
+	req.Body = bodyBuffer
+
+	return bodyBuffer, nil
 }
+
 func handleConnection(cn net.Conn, wg *sync.WaitGroup, server *Server) {
 	// cn management
 	defer cn.Close()
 	defer wg.Done()
 
 	fmt.Println("Connection ", cn)
+	res := &Response{
+		Headers: make(map[string]string),
+	}
 
 	// request reading and parsing
 	// Drain the HTTP request first. Closing a TCP socket while unread
 	// request bytes remain in the receive buffer makes Windows send RST
 	reader := bufio.NewReader(cn)
 
-	finalReq, parseErr := parseHeader(reader)
-	if parseErr != nil {
-		log.Println("Error in parsing the header lines", parseErr)
+	finalReq, err := parseHeader(reader)
+	if err != nil {
+		log.Println("Error in parsing the header lines", err)
+		server.HandleError(&HTTPError{
+			StatusCode: 400,
+			Message:    "Bad Request",
+			Err:        err,
+		}, res)
+		_ = WriteResponse(cn, res)
 		return
 	}
-	bodyBuf, parseBodyErr := parseBody(reader, &finalReq)
+	_, err = parseBody(reader, &finalReq)
 
-	if parseBodyErr != nil {
-		log.Println("Error in parsing the body", parseBodyErr)
+	if err != nil {
+		log.Println("Error in parsing the body", err)
+		server.HandleError(err, res)
+		_ = WriteResponse(cn, res)
 		return
 	}
 
 	fmt.Println("We parsed and got this", finalReq)
-	fmt.Printf("And body is %q\n", string(bodyBuf))
 
-	resInit := &Response{
-		Headers: make(map[string]string),
+	if err := server.HandleRequest(&finalReq, res); err != nil {
+		server.HandleError(err, res)
 	}
 
-	if reqHandleErr := server.HandleRequest(&finalReq, resInit); reqHandleErr != nil {
-		server.HandleError(reqHandleErr, resInit)
+	if err := WriteResponse(cn, res); err != nil {
+		log.Printf("Error writing response: %v", err)
 	}
-
-	WriteResponse(cn, resInit)
 }
 
 func startServer() {
