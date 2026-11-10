@@ -36,6 +36,16 @@ type Request struct {
 	QueryParams     url.Values
 }
 
+const (
+	maxRequestLine = 8 * 1024
+	maxHeaderSize  = 32 * 1024
+	maxHeaderCount = 100
+	maxBodySize    = 1 << 20 // 1 MiB
+
+	maxTrailerSize  = 32 * 1024
+	maxTrailerCount = 100
+)
+
 func isTokenChar(c byte) bool {
 	if c >= 'a' && c <= 'z' ||
 		c >= 'A' && c <= 'Z' ||
@@ -272,12 +282,47 @@ func NewServer() *Server {
 	return &Server{}
 }
 
+func ReadLineWithLimit(reader *bufio.Reader, maxLimit int) (string, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+
+		if len(part)+len(line) > maxLimit {
+			return "", fmt.Errorf("line exceeded maximum size")
+		}
+		line = append(line, part...)
+
+		if err == nil {
+			// got one full line , break
+			break
+		}
+		if err != bufio.ErrBufferFull {
+			// other error in reading
+			return "", err
+		}
+		// err == ErrBufferFull means, continue & go to next iteration and stich until we get "\n"
+	}
+
+	// when we exit the loop, we got one full line, now check conditions on that full line
+	// 1. ends with '\n'
+	// 2. last one before char is '\r'
+	// 3. at least size should be 2 ; (\r\n) is min req in a line
+
+	if len(line) < 2 || line[len(line)-1] != '\n' || line[len(line)-2] != '\r' {
+		return "", fmt.Errorf("invalid line ending")
+	}
+
+	return string(line[:len(line)-2]), nil // strip CRLF (\r\n)
+
+}
 func parseHeader(reader *bufio.Reader) (Request, error) {
 	parsedReq := Request{}
 	parsedReq.Headers = make(map[string][]string)
 
 	// 1. Parsing the first request line (method one)
-	requestLine, err := reader.ReadString('\n')
+	// requestLine, err := reader.ReadString('\n') // old
+	requestLine, err := ReadLineWithLimit(reader, maxRequestLine)
+
 	if err != nil {
 		return parsedReq, fmt.Errorf("Error in reading the request line %w", err)
 	}
@@ -311,11 +356,24 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 
 	// 2. Parsing the field names / headers ( key : values ) until the blank line
 	// example Host: x.com , Content-Length: 11
+
+	headerCount := 0
+	totalHeaderSize := 0
 	for {
-		line, err := reader.ReadString('\n')
+		// line, err := reader.ReadString('\n') // old
+		line, err := ReadLineWithLimit(reader, maxHeaderSize)
 		if err != nil {
 			log.Println("err reading request", err)
 			return parsedReq, fmt.Errorf("Error in reading the header line %w", err)
+		}
+
+		totalHeaderSize += len(line) + 2 // include CRLF
+
+		if totalHeaderSize > maxHeaderSize {
+			return parsedReq, &HTTPError{
+				StatusCode: 431,
+				Message:    "Request Header Fields Too Large",
+			}
 		}
 
 		line = strings.TrimRight(line, "\r\n")
@@ -324,10 +382,19 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 			fmt.Println("its a \r\n line ")
 			break
 		}
+
+		headerCount++
+
+		if headerCount > maxHeaderCount {
+			return parsedReq, &HTTPError{
+				StatusCode: 431,
+				Message:    "too many request headers",
+			}
+		}
 		headerParts := strings.SplitN(line, ":", 2) // split into exactly 2 ; ex : Content-Length: 11
 
 		if len(headerParts) != 2 {
-			return parsedReq, fmt.Errorf("Incorrect header: %q", line)
+			return parsedReq, fmt.Errorf("incorrect header: %q", line)
 		}
 		key := strings.ToLower(strings.TrimSpace(headerParts[0])) // lower for avoid case-insensitive
 		value := strings.TrimSpace(headerParts[1])
@@ -348,20 +415,200 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 	return parsedReq, nil
 }
 
+// just consume from the reader, dont store for now.
+func consumeTrailers(reader *bufio.Reader) error {
+
+	totalSize := 0
+	count := 0
+
+	for {
+		line, err := ReadLineWithLimit(reader, maxTrailerSize)
+		if err != nil {
+			return &HTTPError{
+				StatusCode: 400,
+				Message:    "invalid chunk trailers",
+				Err:        err,
+			}
+		}
+
+		totalSize += len(line) + 2 // include CRLF
+
+		if totalSize > maxTrailerSize {
+			return &HTTPError{
+				StatusCode: 431,
+				Message:    "trailer section too large",
+			}
+		}
+
+		// Empty line means trailer section is finished.
+		if line == "" {
+			return nil
+		}
+
+		count++
+
+		if count > maxTrailerCount {
+			return &HTTPError{
+				StatusCode: 431,
+				Message:    "too many trailer fields",
+			}
+		}
+
+		key, value, found := strings.Cut(line, ":")
+
+		if !found || key == "" {
+			return &HTTPError{
+				StatusCode: 400,
+				Message:    "invalid trailer field",
+			}
+		}
+
+		for i := 0; i < len(key); i++ {
+			if !isTokenChar(key[i]) {
+				return &HTTPError{
+					StatusCode: 400,
+					Message:    "invalid trailer field name",
+				}
+			}
+		}
+
+		value = strings.Trim(value, " \t")
+
+		for i := 0; i < len(value); i++ {
+			if value[i] < 32 && value[i] != '\t' ||
+				value[i] == 127 {
+				return &HTTPError{
+					StatusCode: 400,
+					Message:    "invalid trailer field value",
+				}
+			}
+		}
+
+		// Do not accept framing or routing fields as trailers.
+		switch strings.ToLower(key) {
+		case "content-length", "transfer-encoding", "host", "trailer":
+			return &HTTPError{
+				StatusCode: 400,
+				Message:    "forbidden trailer field",
+			}
+		}
+	}
+}
+func parseChunkedBody(reader *bufio.Reader, maxBodySize int) ([]byte, error) {
+	// extract chunk size
+	// convert chunk size (hexa) to int
+	// check chunk size == 0; if yes, then check if they're any trailers present
+	// check max size limit
+	// read chunk size no. of bytes to body
+	// CRITICAL: at last , post reading the above bytes, check it ends with CRLF
+
+	var body []byte
+
+	for {
+
+		line, err := ReadLineWithLimit(reader, maxRequestLine)
+		if err != nil {
+			return nil, &HTTPError{
+				StatusCode: 400,
+				Message:    "invalid chunk line size",
+				Err:        err,
+			}
+		}
+
+		// extract chunk size from "10;ext1;ext2=hello"
+		// chunkSize;extraData;....
+		sizeText, _, _ := strings.Cut(line, ";")
+		if sizeText == "" {
+			return nil, &HTTPError{StatusCode: 400, Message: "empty chunk size"}
+		}
+
+		// chunk size ( hexa to 64 int )
+		chunkSize, err := strconv.ParseUint(sizeText, 16, 64)
+		if err != nil {
+			return nil, &HTTPError{StatusCode: 400, Message: "invalid chunk size", Err: err}
+		}
+
+		// if chunkSize == 0 , then check for trailers; Trailers = late-calculated metadata
+		if chunkSize == 0 {
+			// check for trailers
+			if err := consumeTrailers(reader); err != nil {
+				return nil, err
+			}
+			return body, nil
+		}
+
+		// check max size limit
+		if chunkSize > uint64(maxBodySize-len(body)) {
+			return nil, &HTTPError{StatusCode: 413, Message: "request body too large"}
+		}
+
+		//read chunkSize no. of bytes to body
+		chunk := make([]byte, int(chunkSize))
+
+		if _, err := io.ReadFull(reader, chunk); err != nil {
+			return nil, &HTTPError{StatusCode: 400, Message: "incomplete chunk data", Err: err}
+		}
+
+		body = append(body, chunk...)
+
+		// chunk data must be followed by CRLF
+		var ending [2]byte
+		if _, err = io.ReadFull(reader, ending[:]); err != nil || ending != [2]byte{'\r', '\n'} {
+			return nil, &HTTPError{StatusCode: 400, Message: "invalid chunk ending", Err: err}
+		}
+
+	}
+}
 func parseBody(reader *bufio.Reader, req *Request) ([]byte, error) {
 
-	const maxBodySize = 1 << 20 // 1 MiB
+	if req == nil {
+		return nil, fmt.Errorf("nil request")
+	}
 
-	// Reject unsupported transfer encoding for now.
-	if len(req.Headers["transfer-encoding"]) > 0 {
+	transferEncodings := req.Headers["transfer-encoding"]
+	contentLengths := req.Headers["content-length"]
+
+	if len(transferEncodings) > 0 && len(contentLengths) > 0 {
+		// both cant exist at once
 		return nil, &HTTPError{
-			StatusCode: 501,
-			Message:    "Transfer-Encoding is not supported",
+			StatusCode: 400,
+			Message:    "Transfer-Encoding & Content-Length both cant be present",
 		}
 	}
 
-	contentLengths := req.Headers["content-length"]
+	// handle transfer encoding
+	if len(transferEncodings) > 0 {
+		// rm dups
+		if len(transferEncodings) != 1 {
+			return nil, &HTTPError{
+				StatusCode: 400,
+				Message:    "multiple Transfer-Encoding headers",
+			}
+		}
 
+		encoded := strings.TrimSpace(transferEncodings[0])
+		// Transfer-Encoding: chunked
+
+		if !strings.EqualFold(encoded, "chunked") {
+			// only chunked is accepted
+			return nil, &HTTPError{
+				StatusCode: 501,
+				Message:    "Transfer-Encoding is not supported",
+			}
+		}
+
+		// retrieving body from the stream 5\r\nHello\r\n0
+		body, err := parseChunkedBody(reader, maxBodySize)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Body = body
+		return body, nil
+
+	}
+
+	// handle content length
 	if len(contentLengths) == 0 {
 		req.Body = nil
 		return nil, nil
@@ -370,7 +617,7 @@ func parseBody(reader *bufio.Reader, req *Request) ([]byte, error) {
 	if len(contentLengths) != 1 {
 		return nil, &HTTPError{
 			StatusCode: 400,
-			Message:    "Multiple Content-Length headers",
+			Message:    "multiple Content-Length headers",
 		}
 	}
 
@@ -378,7 +625,7 @@ func parseBody(reader *bufio.Reader, req *Request) ([]byte, error) {
 	if err != nil || contentLength < 0 {
 		return nil, &HTTPError{
 			StatusCode: 400,
-			Message:    "Invalid Content-Length",
+			Message:    "invalid Content-Length",
 		}
 	}
 
