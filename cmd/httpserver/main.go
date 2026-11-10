@@ -122,7 +122,7 @@ func (s *Server) HandleError(
 
 	var httpErr *HTTPError
 
-	if errors.As(err, httpErr) {
+	if errors.As(err, &httpErr) {
 		res.StatusCode = httpErr.StatusCode
 		res.Body = []byte(httpErr.Message)
 	} else {
@@ -272,7 +272,7 @@ func WriteResponse(cn net.Conn, res *Response) error {
 
 	_, writeErr := io.Copy(cn, &responseCn)
 	if writeErr != nil {
-		return fmt.Errorf("writing response: %w", err)
+		return fmt.Errorf("writing response: %w", writeErr)
 	}
 
 	return nil
