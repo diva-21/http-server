@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +21,12 @@ type HTTPError struct {
 	Err        error
 }
 
-type Server struct{} // for now empty. later will add Routes
+type Handler func(*Request, *Response) error
+
+type Server struct {
+	routes map[string]map[string]Handler // path->method->handler
+	mu     sync.RWMutex
+}
 type Response struct {
 	StatusCode int
 	Headers    map[string]string
@@ -46,6 +52,52 @@ const (
 	maxTrailerCount = 100
 )
 
+// sample registered routes
+
+func homeHandler(req *Request, res *Response) error {
+
+	ensureHeaders(res)
+
+	res.StatusCode = 200
+	res.Headers["Content-Type"] = "text/plain"
+	res.Body = []byte("Welcome to my HTTP server")
+
+	return nil
+}
+
+func getUsers(req *Request, res *Response) error {
+
+	ensureHeaders(res)
+
+	fmt.Println("Requested QueryParams: ", req.QueryParams)
+	res.StatusCode = 200
+	res.Headers["Content-Type"] = "text/plain"
+	res.Body = []byte("Getting all users")
+
+	return nil
+}
+
+func createUser(req *Request, res *Response) error {
+
+	ensureHeaders(res)
+
+	res.StatusCode = 201
+	res.Headers["Content-Type"] = "text/plain"
+	res.Body = []byte("User created successfully")
+
+	return nil
+}
+
+func deleteUser(req *Request, res *Response) error {
+
+	ensureHeaders(res)
+
+	res.StatusCode = 200
+	res.Headers["Content-Type"] = "text/plain"
+	res.Body = []byte("User deleted successfully")
+
+	return nil
+}
 func isTokenChar(c byte) bool {
 	if c >= 'a' && c <= 'z' ||
 		c >= 'A' && c <= 'Z' ||
@@ -194,39 +246,68 @@ func (s *Server) HandleDELETE(req *Request, res *Response) error {
 }
 func (s *Server) HandleRequest(req *Request, res *Response) error {
 
-	// ensure headers are initialized
-	ensureHeaders(res)
+	if s == nil {
+		return fmt.Errorf("nil server")
+	}
 
 	if req == nil || res == nil {
 		return fmt.Errorf("nil request or response")
 	}
 
-	method := strings.TrimSpace(strings.ToUpper(req.Method))
-	if method == "" {
-		log.Println("Method cant be empty", method)
-		return fmt.Errorf("Method empty error :%q", method)
+	// ensure headers are initialized
+	ensureHeaders(res)
+
+	if req.Method == "" {
+		return &HTTPError{
+			StatusCode: 400,
+			Message:    "Bad Request",
+		}
 	}
 
-	switch method {
+	//read lock
+	s.mu.RLock()
 
-	case "GET":
-		return s.HandleGET(req, res)
+	// first look for the path
+	methodRoutes, pathExists := s.routes[req.ResourcePath]
+	if !pathExists {
 
-	case "POST":
-		return s.HandlePOST(req, res)
+		s.mu.RUnlock() // unlock, no routes present for this path
 
-	case "PUT":
-		return s.HandlePUT(req, res)
+		return &HTTPError{
+			StatusCode: 404,
+			Message:    "Not Found",
+		}
+	}
 
-	case "DELETE":
-		return s.HandleDELETE(req, res)
+	//next look for the requested method for the path
+	handler, methodsExists := methodRoutes[req.Method]
 
-	default:
+	if !methodsExists {
+
+		allowedMethods := make([]string, 0, len(methodRoutes))
+
+		for method := range methodRoutes {
+			allowedMethods = append(allowedMethods, method)
+		}
+
+		s.mu.RUnlock()
+
+		sort.Strings(allowedMethods)
+
+		res.Headers["Allow"] = strings.Join(allowedMethods, ", ")
+
 		return &HTTPError{
 			StatusCode: 405,
 			Message:    "Method Not Allowed",
 		}
+
 	}
+
+	s.mu.RUnlock() // dont wait the handler to complete its execution; we need to just the right handler.
+
+	// execute the matched handler
+	return handler(req, res)
+
 }
 
 func WriteResponse(cn net.Conn, res *Response) error {
@@ -279,7 +360,61 @@ func WriteResponse(cn net.Conn, res *Response) error {
 }
 
 func NewServer() *Server {
-	return &Server{}
+	return &Server{
+		routes: make(map[string]map[string]Handler),
+	}
+}
+
+func (s *Server) Handle(method, path string, handler Handler) error {
+	if s == nil {
+		return fmt.Errorf("nil server")
+	}
+	if method == "" {
+		return fmt.Errorf("empty http method")
+	}
+
+	if path == "" || !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("invalid route path: %q", path)
+	}
+
+	if strings.ContainsAny(path, "?#") {
+		// query param would be handled in parsing logic and not here.
+		// frags not allowed for now
+		return fmt.Errorf("route path must not contain query or fragment")
+	}
+
+	if handler == nil {
+		return fmt.Errorf("nil handler")
+	}
+
+	// same validation logic
+	for i := 0; i < len(method); i++ {
+		if !isTokenChar(method[i]) {
+			return fmt.Errorf("invalid HTTP method: %q", method)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// init
+	if s.routes == nil {
+		s.routes = make(map[string]map[string]Handler)
+	}
+
+	// init method map
+	if _, exists := s.routes[path]; !exists {
+		s.routes[path] = make(map[string]Handler)
+	}
+
+	// check if its already present
+	if _, exists := s.routes[path][method]; !exists {
+		fmt.Errorf("route already registered : %s %s ", method, path)
+	}
+
+	// register the handler
+	s.routes[path][method] = handler
+
+	return nil
 }
 
 func ReadLineWithLimit(reader *bufio.Reader, maxLimit int) (string, error) {
@@ -335,9 +470,36 @@ func parseHeader(reader *bufio.Reader) (Request, error) {
 	}
 
 	// METHOD /RESOURCE-PATH PROTOCOL-VERSION 	\r\n
-	parsedReq.Method = strings.ToUpper(splitReqLines[0])
-	parsedReq.ResourcePath = splitReqLines[1]
+	parsedReq.Method = splitReqLines[0]
 	parsedReq.ProtocolVersion = splitReqLines[2]
+
+	parsedReq.ResourcePath = splitReqLines[1]
+
+	target, err := url.ParseRequestURI(splitReqLines[1])
+	if err != nil ||
+		target.IsAbs() ||
+		target.Host != "" ||
+		target.Fragment != "" ||
+		!strings.HasPrefix(target.Path, "/") {
+
+		return parsedReq, &HTTPError{
+			StatusCode: 400,
+			Message:    "Invalid request target",
+		}
+	}
+
+	// store only the resource path
+	parsedReq.ResourcePath = target.Path // contains /users
+
+	// extract query parameters
+	parsedReq.QueryParams, err = url.ParseQuery(target.RawQuery) // rawQuery contains id=1&name=Sai
+	if err != nil {
+		return parsedReq, &HTTPError{
+			StatusCode: 400,
+			Message:    "Invalid query parameters",
+			Err:        err,
+		}
+	}
 
 	// validate for Method
 	for i := 0; i < len(parsedReq.Method); i++ {
@@ -713,6 +875,23 @@ func startServer() {
 	// Body reading & parsing
 	// Response formatting
 	server := NewServer()
+
+	if err := server.Handle("GET", "/", homeHandler); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := server.Handle("GET", "/users", getUsers); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := server.Handle("POST", "/users", createUser); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := server.Handle("DELETE", "/users", deleteUser); err != nil {
+		log.Fatal(err)
+	}
+
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		log.Fatal("error ", err)
