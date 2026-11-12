@@ -6,6 +6,23 @@ I built this project to understand how HTTP works under the hood — from accept
 
 The implementation follows the basics of [RFC 9112](https://datatracker.ietf.org/doc/html/rfc9112).
 
+## Architecture
+
+Each accepted TCP connection is handled in its own goroutine. The connection is parsed into a request, matched by exact path and method, and answered with one HTTP/1.1 response. The socket is then closed (`Connection: close`). `net/http` is not used.
+
+```mermaid
+flowchart LR
+    Client[Client] --> Server[server]
+    Server --> Parser[parser]
+    Parser --> Router[router]
+    Router --> Response[response]
+    Parser --> Errors[errors]
+    Router --> Errors
+    Errors --> Response
+```
+
+`cmd/server` registers routes. `server` accepts TCP and runs one goroutine per connection. `parser` reads the request, `router` matches path and method, and `response` writes the reply and closes the socket. Bad requests, missing routes, and handler failures go through `errors` first.
+
 ## Features
 
 - **TCP server:** Accepts connections and handles each client in a separate goroutine.
